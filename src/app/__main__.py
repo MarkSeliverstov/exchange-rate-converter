@@ -1,6 +1,5 @@
-def main() -> None:
-    print("Hello, World!")
-
+from .app import App
 
 if __name__ == "__main__":
-    main()
+    app = App()
+    app.run()
