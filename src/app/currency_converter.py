@@ -6,14 +6,27 @@ from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from aiohttp import ClientSession
+from cachetools import TTLCache
 from structlog import BoundLogger, get_logger
 from websockets import Data, WebSocketClientProtocol, connect
 
 logger: BoundLogger = get_logger(__package__)
 
 
-class HearbeatTimeoutError(Exception):
+class HearbeatTimeoutError(TimeoutError):
     pass
+
+
+class InvalidCurrencyError(ValueError):
+    def __init__(self, message="Requested exchange rate conversion is not supported"):
+        super().__init__(message)
+
+
+cache: TTLCache = TTLCache(maxsize=100, ttl=2 * 60 * 60)
+"""
+Cache to store exchange rates for 2 hours, as external exchange rates are
+expected to be cached for 2 hours to prevent unnecessary traffic on external API.
+"""
 
 
 class CurrencyConverter:
@@ -34,7 +47,7 @@ class CurrencyConverter:
         try:
             await self.setup()
             await self.start()
-        except asyncio.CancelledError:
+        except Exception:
             logger.info("App stopped")
         finally:
             await self.aclose()
@@ -58,11 +71,6 @@ class CurrencyConverter:
                 )
                 await asyncio.sleep(self.connection_retry_time)
                 logger.info("Reconnecting")
-            except Exception as e:
-                logger.error("Error in connection", error=e)
-                logger.info(f"Reconnecting in {self.connection_retry_time} seconds")
-                await asyncio.sleep(self.connection_retry_time)
-                logger.info("Reconnecting")
 
     def generate_get_exchange_rate_url(self, base_currency: str, target_currency: str) -> str:
         return (
@@ -80,19 +88,35 @@ class CurrencyConverter:
         # Decimals are used to avoid floating point arithmetic errors
         return str(value.quantize(Decimal(f'1.{"0"*precision}'), rounding=ROUND_DOWN))
 
+    async def get_exchange_rate(self, base_currency: str, target_currency: str) -> float:
+        cache_key: str = f"{base_currency}-{target_currency}"
+        if cache_key in cache:
+            if not cache[cache_key]:
+                raise InvalidCurrencyError()
+            return cache[cache_key]
+
+        url: str = self.generate_get_exchange_rate_url(base_currency, target_currency)
+        async with self.client_session.get(url) as response:
+            data: dict[str, Any] = await response.json()
+            logger.debug("Exchange rate response", data=data)
+            if data.get("errors"):
+                cache[cache_key] = None
+                raise InvalidCurrencyError()
+
+        rate = data["data"][target_currency]
+        cache[cache_key] = rate
+        return rate
+
     async def convert_currency(self, msg: dict[str, Any]) -> dict[str, Any] | None:
         try:
             base_currency: str = msg["payload"]["currency"]
             base_stake: float = msg["payload"]["stake"]
-            target_currency: str = "EUR"
+            target_currency: str = "EEE"
 
-            url: str = self.generate_get_exchange_rate_url(base_currency, target_currency)
-            async with self.client_session.get(url) as response:
-                data: dict[str, Any] = await response.json()
-            rate: float = data["data"][target_currency]
+            rate: float = await self.get_exchange_rate(base_currency, target_currency)
+            new_stake: Decimal = Decimal(str(base_stake)) * Decimal(str(rate))
 
             msg["payload"]["currency"] = target_currency
-            new_stake: Decimal = Decimal(str(base_stake)) * Decimal(str(rate))
             msg["payload"]["stake"] = self.format_stake(new_stake, 5)
             msg["payload"]["date"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             return msg
@@ -114,14 +138,16 @@ class CurrencyConverter:
                 message: Data = await asyncio.wait_for(ws.recv(), timeout=self.hearbeat_timeout)
                 data: dict[str, Any] = json.loads(message)
                 if data.get("type") == "heartbeat":
+                    logger.debug("Received heartbeat, we are alive :D")
                     if (datetime.now() - last_heartbeat).seconds > self.hearbeat_timeout:
                         raise HearbeatTimeoutError("Heartbeat timeout")
                     last_heartbeat = datetime.now()
                     continue
                 if data.get("type") != "message":
-                    logger.warning("Unknown message type", data=data)
+                    logger.debug("Unknown message type", data=data)
                     continue
 
+                logger.info("Received message", data=data)
                 await ws.send(json.dumps(await self.convert_currency(data)))
             except asyncio.TimeoutError:
                 raise HearbeatTimeoutError("Heartbeat timeout")
