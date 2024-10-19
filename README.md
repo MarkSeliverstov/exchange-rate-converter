@@ -6,7 +6,7 @@ CCA time spent on the project: 5h
 ## Requirementsa
 
 - API key from [app.freecurrencyapi.com](https://app.freecurrencyapi.com)
-- Server to connect to.
+- Server to connect to (or you can use mocked server [server.py](./src/external_server_mock/server.py))
 
 ## Usage
 
@@ -18,17 +18,35 @@ export CURRENCY_ASSIGNMENT_WS_URI=<ws_uri>  # URI of the WebSocket server to con
                                             # (optional, default is ws://localhost:8765)
 ```
 
-After setting the environment variables, you can run the application using
+After setting the environment variables, you can run the application using (but
+make sure the WebSocket server is running on the same network):
 
 ```bash
 docker-compose up
 ```
 
-or
+or more proper way (due to possible network issues):
+
+#### Install dependencies
 
 ```bash
 poetry install
+```
+
+#### Run the application
+
+```bash
+poetry shell
 poetry run rate_converter
+```
+
+#### Run the WebSocket server
+
+For the mocked server, you can run the following command in a separate terminal:
+
+```bash
+poetry shell
+poetry run mock_server
 ```
 
 ## Architectural and technical decisions

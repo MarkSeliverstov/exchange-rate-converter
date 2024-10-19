@@ -188,8 +188,8 @@ class CurrencyConverter:
             await asyncio.sleep(self.hearbeat_interval)
 
     async def handler(self, ws: WebSocketClientProtocol) -> None:
-        consumer_task = asyncio.create_task(self.consume(ws))
-        producer_task = asyncio.create_task(self.produce(ws))
+        consumer_task: asyncio.Task[None] = asyncio.create_task(self.consume(ws))
+        producer_task: asyncio.Task[None] = asyncio.create_task(self.produce(ws))
 
         done, pending = await asyncio.wait(
             [consumer_task, producer_task],

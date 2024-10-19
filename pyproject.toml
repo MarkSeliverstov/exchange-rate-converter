@@ -28,6 +28,7 @@ types-cachetools = "^5.5.0.20240820"
 
 [tool.poetry.scripts]
 rate_converter = "app.__main__:main"
+mock_server = "external_server_mock.server:main"
 
 [tool.pytest.ini_options]
 addopts = """
