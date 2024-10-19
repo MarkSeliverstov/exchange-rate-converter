@@ -1,7 +1,7 @@
 from .currency_converter import CurrencyConverter
 
 
-def main():
+def main() -> None:
     app = CurrencyConverter()
     app.run()
 
