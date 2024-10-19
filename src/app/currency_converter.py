@@ -46,19 +46,19 @@ class CurrencyConverter:
         self.hearbeat_timeout: int = 2
         self.hearbeat_interval: int = 1
 
+    def run(self) -> None:
+        asyncio.run(self.async_run())
+
     async def async_run(self) -> None:
         logger.info("Starting app")
         try:
             await self.setup()
             await self.start()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             logger.info("App stopped")
         finally:
             await self.aclose()
             logger.info("App closed, resources released")
-
-    def run(self) -> None:
-        asyncio.run(self.async_run())
 
     async def setup(self) -> None:
         self.client_session = ClientSession()
@@ -69,14 +69,11 @@ class CurrencyConverter:
             try:
                 async with connect(self.currency_assignment_ws_uri) as ws:
                     await self.handler(ws)
-            except HearbeatTimeoutError:
+            except (HearbeatTimeoutError, OSError) as error:
                 logger.warning(
-                    f"Hearbeat timeout, reconnecting in {self.connection_retry_time} seconds"
+                    f"Reconnecting in {self.connection_retry_time} seconds due error: {error}"
                 )
                 await asyncio.sleep(self.connection_retry_time)
-            except asyncio.CancelledError:
-                logger.info("Connection closed")
-                break
             except Exception as error:
                 logger.error("Unexpected error", error=error)
                 raise error
@@ -91,6 +88,22 @@ class CurrencyConverter:
             "type": "error",
             "id": id,
             "message": f"Unable to convert stake. Error: {error}",
+        }
+
+    def generate_response_message(
+        self, original_message: dict[str, Any], new_stake: str, new_currency: str
+    ) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "id": original_message["id"],
+            "payload": {
+                "marketId": original_message["payload"]["marketId"],
+                "selectionId": original_message["payload"]["selectionId"],
+                "odds": original_message["payload"]["odds"],
+                "stake": new_stake,
+                "currency": new_currency,
+                "date": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            },
         }
 
     def format_stake(self, value: Decimal, precision: int) -> str:
@@ -111,10 +124,11 @@ class CurrencyConverter:
         url: str = self.generate_get_exchange_rate_url(base_currency, target_currency)
         async with self.client_session.get(url) as response:
             data: dict[str, Any] = await response.json()
-            logger.debug("Exchange rate response", data=data)
-            if data.get("errors"):
-                cache[cache_key] = None
-                raise InvalidCurrencyError()
+
+        logger.debug("Exchange rate response", data=data)
+        if data.get("errors"):
+            cache[cache_key] = None
+            raise InvalidCurrencyError()
 
         rate = Decimal(str(data["data"][target_currency]))
         cache[cache_key] = rate
@@ -128,11 +142,9 @@ class CurrencyConverter:
 
             rate: Decimal = await self.get_exchange_rate(base_currency, target_currency)
             new_stake: Decimal = Decimal(str(base_stake)) * Decimal(rate)
-
-            msg["payload"]["currency"] = target_currency
-            msg["payload"]["stake"] = self.format_stake(new_stake, 5)
-            msg["payload"]["date"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-            return msg
+            return self.generate_response_message(
+                msg, self.format_stake(new_stake, 5), target_currency
+            )
         except KeyError as error:
             logger.error("Missing key in message", error=error)
             if msg.get("id"):
@@ -150,12 +162,14 @@ class CurrencyConverter:
             try:
                 message: Data = await asyncio.wait_for(ws.recv(), timeout=self.hearbeat_timeout)
                 data: dict[str, Any] = json.loads(message)
+
                 if data.get("type") == "heartbeat":
                     logger.debug("Received heartbeat, we are alive :D")
                     if (datetime.now() - last_heartbeat).seconds > self.hearbeat_timeout:
                         raise HearbeatTimeoutError("Heartbeat timeout")
                     last_heartbeat = datetime.now()
                     continue
+
                 if data.get("type") != "message":
                     logger.debug("Unknown message type", data=data)
                     continue
