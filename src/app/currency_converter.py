@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+from datetime import UTC, datetime
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from aiohttp import ClientSession
@@ -10,14 +12,19 @@ from websockets import Data, WebSocketClientProtocol, connect
 logger: BoundLogger = get_logger(__package__)
 
 
-class App:
+class HearbeatTimeoutError(Exception):
+    pass
+
+
+class CurrencyConverter:
     def __init__(self) -> None:
-        self.client_session: ClientSession = ClientSession()
         api_key: str | None = os.getenv("FREECURRENCY_API_KEY")
         assert api_key, "API_KEY environment variable is required"
-        self.exchange_endpoint: str = f"https://freecurrencyapi.com/api/v1/latest?apikey={api_key}"
+        self.exchange_endpoint: str = f"https://api.freecurrencyapi.com/v1/latest?apikey={api_key}"
 
-        self.ws_uri: str = "wss://currency-assignment.ematiq.com"
+        self.currency_assignment_ws_uri: str = os.getenv(
+            "CURRENCY_ASSIGNMENT_WS_URI", "ws://localhost:8765"
+        )
         self.connection_retry_time: int = 5
         self.hearbeat_timeout: int = 2
         self.hearbeat_interval: int = 1
@@ -25,6 +32,7 @@ class App:
     async def async_run(self) -> None:
         logger.info("Starting app")
         try:
+            await self.setup()
             await self.start()
         except asyncio.CancelledError:
             logger.info("App stopped")
@@ -35,28 +43,42 @@ class App:
     def run(self) -> None:
         asyncio.run(self.async_run())
 
+    async def setup(self) -> None:
+        self.client_session: ClientSession = ClientSession()
+
     async def start(self) -> None:
         while True:
             logger.info("Creating new connection")
             try:
-                async with connect(self.ws_uri) as ws:
+                async with connect(self.currency_assignment_ws_uri) as ws:
                     await self.handler(ws)
+            except HearbeatTimeoutError:
+                logger.warning(
+                    f"Hearbeat timeout, reconnecting in {self.connection_retry_time} seconds"
+                )
+                await asyncio.sleep(self.connection_retry_time)
+                logger.info("Reconnecting")
             except Exception as e:
                 logger.error("Error in connection", error=e)
                 logger.info(f"Reconnecting in {self.connection_retry_time} seconds")
                 await asyncio.sleep(self.connection_retry_time)
+                logger.info("Reconnecting")
 
     def generate_get_exchange_rate_url(self, base_currency: str, target_currency: str) -> str:
         return (
             f"{self.exchange_endpoint}&currencies={target_currency}&base_currency={base_currency}"
         )
 
-    def generate_error_message(self, id: int, error: Exception) -> dict[str, Any]:
+    def generate_error_message(self, id: int, error: str) -> dict[str, Any]:
         return {
             "type": "error",
             "id": id,
-            "message": f"Unable to convert stake. Error: {str(error)}",
+            "message": f"Unable to convert stake. Error: {error}",
         }
+
+    def format_stake(self, value: Decimal, precision: int) -> str:
+        # Decimals are used to avoid floating point arithmetic errors
+        return str(value.quantize(Decimal(f'1.{"0"*precision}'), rounding=ROUND_DOWN))
 
     async def convert_currency(self, msg: dict[str, Any]) -> dict[str, Any] | None:
         try:
@@ -70,27 +92,39 @@ class App:
             rate: float = data["data"][target_currency]
 
             msg["payload"]["currency"] = target_currency
-            msg["payload"]["stake"] = base_stake * rate
+            new_stake: Decimal = Decimal(str(base_stake)) * Decimal(str(rate))
+            msg["payload"]["stake"] = self.format_stake(new_stake, 5)
+            msg["payload"]["date"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             return msg
-        except Exception as error:
-            logger.error("Error converting currency", error=str(error))
+        except KeyError as error:
+            logger.error("Missing key in message", error=error)
             if msg.get("id"):
-                return self.generate_error_message(msg["id"], error)
+                return self.generate_error_message(msg["id"], f"Missing key in message: {error}")
+        except Exception as error:
+            logger.error("Error converting currency", error=error)
+            if msg.get("id"):
+                return self.generate_error_message(msg["id"], str(error))
+        return None
 
     async def consume(self, ws: WebSocketClientProtocol) -> None:
         logger.info("Starting consumer")
+        last_heartbeat: datetime = datetime.now()
         while True:
             try:
                 message: Data = await asyncio.wait_for(ws.recv(), timeout=self.hearbeat_timeout)
                 data: dict[str, Any] = json.loads(message)
-                if data.get("type") == "heartbeat" or data.get("type") == "message":
-                    # Ignore heartbeat and unknown message types
+                if data.get("type") == "heartbeat":
+                    if (datetime.now() - last_heartbeat).seconds > self.hearbeat_timeout:
+                        raise HearbeatTimeoutError("Heartbeat timeout")
+                    last_heartbeat = datetime.now()
                     continue
-                logger.info("Received message", data=data)
+                if data.get("type") != "message":
+                    logger.warning("Unknown message type", data=data)
+                    continue
+
                 await ws.send(json.dumps(await self.convert_currency(data)))
             except asyncio.TimeoutError:
-                logger.warning("Heartbeat timeout, trying to reconnect")
-                break
+                raise HearbeatTimeoutError("Heartbeat timeout")
 
     async def produce(self, ws: WebSocketClientProtocol) -> None:
         logger.info("Starting producer")
@@ -101,12 +135,20 @@ class App:
     async def handler(self, ws: WebSocketClientProtocol) -> None:
         consumer_task = asyncio.create_task(self.consume(ws))
         producer_task = asyncio.create_task(self.produce(ws))
-        _, pending = await asyncio.wait(
+
+        done, pending = await asyncio.wait(
             [consumer_task, producer_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
+
         for task in pending:
             task.cancel()
+
+        for task in done:
+            if task.exception():
+                raise task.exception()
+
+        await ws.close()
 
     async def aclose(self) -> None:
         await self.client_session.close()
