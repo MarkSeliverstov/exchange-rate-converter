@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, TCPConnector
 from cachetools import TTLCache
 from structlog import BoundLogger, get_logger
 from websockets import ConnectionClosedOK, Data, WebSocketClientProtocol, connect
@@ -18,9 +18,8 @@ class HearbeatTimeoutError(TimeoutError):
 
 
 class InvalidCurrencyError(ValueError):
-    def __init__(
-        self, message: str = "Requested exchange rate conversion is not supported"
-    ) -> None:
+    def __init__(self, base_currency: str, target_currency: str) -> None:
+        message: str = f"Invalid currency pair: {base_currency}->{target_currency}"
         super().__init__(message)
 
 
@@ -37,11 +36,10 @@ class CurrencyConverter:
     def __init__(self) -> None:
         api_key: str | None = os.getenv("FREECURRENCY_API_KEY")
         assert api_key, "API_KEY environment variable is required"
+        uri: str | None = os.getenv("CURRENCY_ASSIGNMENT_WS_URI")
+        assert uri, "CURRENCY_ASSIGNMENT_WS_URI environment variable is required"
         self.exchange_endpoint: str = f"https://api.freecurrencyapi.com/v1/latest?apikey={api_key}"
-
-        self.currency_assignment_ws_uri: str = os.getenv(
-            "CURRENCY_ASSIGNMENT_WS_URI", "ws://localhost:8765"
-        )
+        self.currency_assignment_ws_uri: str = uri
         self.connection_retry_time: int = 5
         self.hearbeat_timeout: int = 2
         self.hearbeat_interval: int = 1
@@ -61,7 +59,9 @@ class CurrencyConverter:
             logger.info("App closed, resources released")
 
     async def setup(self) -> None:
-        self.client_session = ClientSession()
+        self.client_session = ClientSession(
+            connector=TCPConnector(verify_ssl=os.getenv("VERIFY_SSL") == "True")
+        )
 
     async def start(self) -> None:
         while True:
@@ -91,7 +91,7 @@ class CurrencyConverter:
         }
 
     def generate_response_message(
-        self, original_message: dict[str, Any], new_stake: str, new_currency: str
+        self, original_message: dict[str, Any], new_stake: float, new_currency: str
     ) -> dict[str, Any]:
         return {
             "type": "message",
@@ -106,9 +106,9 @@ class CurrencyConverter:
             },
         }
 
-    def format_stake(self, value: Decimal, precision: int) -> str:
+    def format_stake(self, value: Decimal, precision: int) -> float:
         # Decimals are used to avoid floating point arithmetic errors
-        return str(value.quantize(Decimal(f'1.{"0"*precision}'), rounding=ROUND_DOWN))
+        return float(value.quantize(Decimal(f'1.{"0"*precision}'), rounding=ROUND_DOWN))
 
     async def get_exchange_rate(self, base_currency: str, target_currency: str) -> Decimal:
         assert self.client_session
@@ -117,43 +117,44 @@ class CurrencyConverter:
         rate: Decimal | None
         if cache_key in cache:
             rate = cache[cache_key]
+            logger.debug("Using cached rate", rate=str(rate), pair=cache_key)
             if not rate:
-                raise InvalidCurrencyError()
+                raise InvalidCurrencyError(base_currency, target_currency)
             return rate
 
         url: str = self.generate_get_exchange_rate_url(base_currency, target_currency)
         async with self.client_session.get(url) as response:
             data: dict[str, Any] = await response.json()
 
-        logger.debug("Exchange rate response", data=data)
         if data.get("errors"):
             cache[cache_key] = None
-            raise InvalidCurrencyError()
+            logger.warning("Invalid request to API", pair=cache_key, errors=data["errors"])
+            raise InvalidCurrencyError(base_currency, target_currency)
 
         rate = Decimal(str(data["data"][target_currency]))
         cache[cache_key] = rate
+        logger.debug("Received rate from API", pair=cache_key, rate=str(rate))
         return rate
 
-    async def convert_currency(self, msg: dict[str, Any]) -> dict[str, Any] | None:
+    async def convert_currency(self, msg: dict[str, Any]) -> dict[str, Any]:
         try:
             base_currency: str = msg["payload"]["currency"]
             base_stake: float = msg["payload"]["stake"]
             target_currency: str = "EUR"
 
             rate: Decimal = await self.get_exchange_rate(base_currency, target_currency)
-            new_stake: Decimal = Decimal(str(base_stake)) * Decimal(rate)
+            new_stake: Decimal = Decimal(str(base_stake)) * rate
             return self.generate_response_message(
                 msg, self.format_stake(new_stake, 5), target_currency
             )
         except KeyError as error:
             logger.error("Missing key in message", error=error)
-            if msg.get("id"):
-                return self.generate_error_message(msg["id"], f"Missing key in message: {error}")
+            return self.generate_error_message(msg["id"], f"Missing key in message: {error}")
+        except InvalidCurrencyError as error:
+            return self.generate_error_message(msg["id"], str(error))
         except Exception as error:
-            logger.error("Error converting currency", error=error)
-            if msg.get("id"):
-                return self.generate_error_message(msg["id"], str(error))
-        return None
+            logger.error("Unexpected error", error=error)
+            return self.generate_error_message(msg["id"], str(error))
 
     async def consume(self, ws: WebSocketClientProtocol) -> None:
         logger.info("Starting consumer")
@@ -164,9 +165,9 @@ class CurrencyConverter:
                 data: dict[str, Any] = json.loads(message)
 
                 if data.get("type") == "heartbeat":
-                    logger.debug("Received heartbeat, we are alive :D")
+                    logger.debug("Received heartbeat, server is alive :D")
                     if (datetime.now() - last_heartbeat).seconds > self.hearbeat_timeout:
-                        raise HearbeatTimeoutError("Heartbeat timeout")
+                        raise HearbeatTimeoutError()
                     last_heartbeat = datetime.now()
                     continue
 
@@ -175,11 +176,13 @@ class CurrencyConverter:
                     continue
 
                 logger.info("Received message", data=data)
-                await ws.send(json.dumps(await self.convert_currency(data)))
+                response: dict[str, Any] | None = await self.convert_currency(data)
+                logger.info("Sending response", data=response)
+                await ws.send(json.dumps(response))
             except asyncio.TimeoutError:
-                raise HearbeatTimeoutError("Heartbeat timeout")
+                raise HearbeatTimeoutError()
             except ConnectionClosedOK:
-                break
+                return
 
     async def produce(self, ws: WebSocketClientProtocol) -> None:
         logger.info("Starting producer")
@@ -199,7 +202,6 @@ class CurrencyConverter:
         for task in pending:
             # Cancel remaining tasks if one of them is done as we want to close and reconnect
             task.cancel()
-        await ws.close()
 
         for task in done:
             if task.exception() is not None:

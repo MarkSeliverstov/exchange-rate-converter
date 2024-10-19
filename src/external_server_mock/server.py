@@ -53,8 +53,10 @@ async def run_server() -> None:
     async with serve(handler, "localhost", 8765):
         await asyncio.get_running_loop().create_future()
 
+
 def main() -> None:
     asyncio.run(run_server())
+
 
 if __name__ == "__main__":
     main()

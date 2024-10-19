@@ -7,9 +7,10 @@ from app.currency_converter import CurrencyConverter
 
 
 def test_format_stake(app: CurrencyConverter) -> None:
-    assert app.format_stake(Decimal("253.67"), 5) == "253.67000"
-    assert app.format_stake(Decimal("253.67"), 2) == "253.67"
-    assert app.format_stake(Decimal("253.67"), 0) == "253"
+    assert app.format_stake(Decimal("253.6754321"), 5) == 253.67543
+    assert app.format_stake(Decimal("253.67"), 5) == 253.67
+    assert app.format_stake(Decimal("253.67"), 2) == 253.67
+    assert app.format_stake(Decimal("253.67"), 0) == 253
 
 
 @pytest.mark.asyncio

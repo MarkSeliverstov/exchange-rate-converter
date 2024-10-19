@@ -1,31 +1,42 @@
 # Exchange Rate Converter
 
-Real-time exchange rate conversion service working over a websocket connection.\
+Real-time exchange rate conversion service working over a websocket connection.
+More infromation and requirements can be found in the [TASK.md](TASK.md).\
 CCA time spent on the project: 5h
 
 ## Requirementsa
 
 - API key from [app.freecurrencyapi.com](https://app.freecurrencyapi.com)
-- Server to connect to (or you can use mocked server [server.py](./src/external_server_mock/server.py))
+- Server to connect to
 
 ## Usage
 
-First, you need to set the environment variables:
+First, you must set the following environment variables in a `.env` file:
 
 ```bash
+# Required:
 export FREECURRENCY_API_KEY=<your_api_key>  # API key from "https://app.freecurrencyapi.com"
 export CURRENCY_ASSIGNMENT_WS_URI=<ws_uri>  # URI of the WebSocket server to connect to
-                                            # (optional, default is ws://localhost:8765)
+
+# Optional:
+export VERIFY_SSL=<True/False>              # SSL verification for aiohttp client
+                                            # Default: True
 ```
 
-After setting the environment variables, you can run the application using (but
-make sure the WebSocket server is running on the same network):
+> NOTE: `VERIFY_SSL` is set to `False` for the `docker-compose` setup. As I don't
+want to deal with self-signed certificates, I disabled SSL verification.
+**Always use `True` for local and production environments with valid
+certificates!**
+
+After setting the environment variables, you can simply run the application using:
 
 ```bash
 docker-compose up
 ```
 
-or more proper way (due to possible network issues):
+or more manually using `Poetry`:
+
+<details>
 
 #### Install dependencies
 
@@ -48,6 +59,8 @@ For the mocked server, you can run the following command in a separate terminal:
 poetry shell
 poetry run mock_server
 ```
+
+</details>
 
 ## Architectural and technical decisions
 
