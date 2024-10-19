@@ -111,7 +111,7 @@ class CurrencyConverter:
         try:
             base_currency: str = msg["payload"]["currency"]
             base_stake: float = msg["payload"]["stake"]
-            target_currency: str = "EEE"
+            target_currency: str = "EUR"
 
             rate: float = await self.get_exchange_rate(base_currency, target_currency)
             new_stake: Decimal = Decimal(str(base_stake)) * Decimal(str(rate))
